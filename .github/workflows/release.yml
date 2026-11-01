@@ -1,0 +1,148 @@
+# 客户端发布（公开发布仓库，Actions 不占私有仓库额度）：用只读机密 SOURCE_TOKEN 拉取私有源码仓库的标签，
+# 编译后把安装包发布到本仓库的 Release。客户端更新渠道 = 本仓库（C190，构建注入 UPDATE_REPO=github.repository）。
+# 编译产物只上传到 Release，不提交进本仓库。
+# 本仓库公开，作业日志所有人可见：不要在步骤里打印源码或机密。
+name: release
+on:
+  workflow_dispatch:
+    inputs:
+      tag: { description: "源码仓库里已推送的标签，例如 v0.0.0.11", required: true }
+      macos: { description: "同时编译 macOS 版", type: boolean, default: false }
+permissions:
+  contents: write
+  actions: write # 汇总发布后删除构建构件
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: true
+defaults:
+  run:
+    working-directory: source # 源码检出到 source/ 目录里编译，不占本仓库根目录
+env:
+  TAG: ${{ inputs.tag }}
+  SOURCE_REPO: Enasdt/Veils-Browser
+  UPDATE_REPO: ${{ github.repository }}
+
+jobs:
+  windows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: "${{ env.SOURCE_REPO }}", ref: "${{ env.TAG }}", token: "${{ secrets.SOURCE_TOKEN }}", persist-credentials: false, path: source }
+      - name: 校验标签与 VERSION、CHANGELOG、平台清单一致
+        run: |
+          python3 -c "import yaml" 2>/dev/null || pip install -q pyyaml
+          python3 scripts/release/notes.py "$TAG" --check-version > /dev/null
+          python3 scripts/build/sync_assets.py --check
+          echo "VER=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with: { go-version-file: source/go.mod }
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm, cache-dependency-path: source/frontend/pnpm-lock.yaml }
+      - name: 前端
+        working-directory: source/frontend
+        run: pnpm install --frozen-lockfile && pnpm build
+      - name: 打包：主程序、更新助手、程序包 zip 与安装器
+        env:
+          SIGN_PFX_B64: ${{ secrets.SIGN_PFX_B64 }}
+          SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
+        run: |
+          if [ -n "$SIGN_PFX_B64" ]; then
+            sudo apt-get install -y -q osslsigncode
+            echo "$SIGN_PFX_B64" | base64 -d > "$RUNNER_TEMP/sign.pfx"; export SIGN_PFX="$RUNNER_TEMP/sign.pfx"
+          fi
+          (cd frontend && pnpm licenses list --prod --json > "$RUNNER_TEMP/fe-licenses.json")
+          bash scripts/build/package_windows.sh --out dist --frontend-licenses "$RUNNER_TEMP/fe-licenses.json"
+          rm -f "$RUNNER_TEMP/sign.pfx"
+      - uses: actions/upload-artifact@v4
+        if: inputs.macos
+        with: { name: release-windows, path: source/dist/*, retention-days: 1 }
+      - name: 发布到本仓库（不勾 macos 时）
+        if: ${{ !inputs.macos }}
+        env: { GH_TOKEN: "${{ github.token }}", GH_REPO: "${{ github.repository }}" }
+        run: |
+          python3 scripts/release/notes.py "$TAG" > "$RUNNER_TEMP/notes.md"
+          EXE=$(python3 scripts/brand/brand.py get identity.exe_name)
+          (cd dist && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          PRE=""; case "$VER" in 0.*) PRE="--prerelease" ;; esac
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release edit "$TAG" --draft=false --title "$EXE $TAG" --notes-file "$RUNNER_TEMP/notes.md" $PRE
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --target main --title "$EXE $TAG" --notes-file "$RUNNER_TEMP/notes.md" $PRE
+          fi
+
+  macos:
+    if: inputs.macos
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env: { MACOSX_DEPLOYMENT_TARGET: "12.0" }
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: "${{ env.SOURCE_REPO }}", ref: "${{ env.TAG }}", token: "${{ secrets.SOURCE_TOKEN }}", persist-credentials: false, path: source }
+      - name: 读版本与程序名
+        run: |
+          echo "VER=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_ENV"
+          echo "EXE=$(python3 scripts/brand/brand.py get identity.exe_name)" >> "$GITHUB_ENV"
+          echo "SLUG=$(python3 scripts/brand/brand.py get identity.slug)" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with: { go-version-file: source/go.mod }
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm, cache-dependency-path: source/frontend/pnpm-lock.yaml }
+      - name: 前端
+        working-directory: source/frontend
+        run: pnpm install --frozen-lockfile && pnpm build
+      - name: 编译通用二进制并打包 .app、zip 与 dmg（ad-hoc 签名）
+        run: |
+          mkdir -p build/bin dist
+          COMMIT=$(git rev-parse --short=7 HEAD)
+          for arch in arm64 amd64; do
+            CGO_ENABLED=1 GOOS=darwin GOARCH=$arch go build -tags production -trimpath -buildvcs=false \
+              -ldflags "-w -s -X main.commit=$COMMIT -X $(go list -m)/internal/app.updateRepo=$UPDATE_REPO" -o "build/bin/$EXE-$arch" .
+            CGO_ENABLED=1 GOOS=darwin GOARCH=$arch go build -tags production -trimpath -buildvcs=false -ldflags "-w -s" -o "build/bin/$SLUG-updater-$arch" ./cmd/updater
+          done
+          lipo -create -output "build/bin/$EXE" "build/bin/$EXE-arm64" "build/bin/$EXE-amd64"
+          lipo -create -output "build/bin/$SLUG-updater" "build/bin/$SLUG-updater-arm64" "build/bin/$SLUG-updater-amd64"
+          APP="build/bin/$EXE.app"
+          rm -rf "$APP" && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "build/bin/$EXE" "build/bin/$SLUG-updater" "$APP/Contents/MacOS/"
+          cp build/darwin/Info.plist "$APP/Contents/"
+          cp build/darwin/icons.icns "$APP/Contents/Resources/"
+          xattr -cr "$APP"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+          ditto -c -k --keepParent "$APP" "dist/$EXE-$VER-macos-universal.zip"
+          mkdir -p build/dmg && cp -R "$APP" build/dmg/ && ln -s /Applications build/dmg/Applications
+          hdiutil create -volname "$EXE $VER" -srcfolder build/dmg -ov -format UDZO "dist/$EXE-$VER-macos-universal.dmg"
+      - uses: actions/upload-artifact@v4
+        with: { name: release-macos, path: source/dist/*, retention-days: 1 }
+
+  publish:
+    needs: [windows, macos]
+    if: ${{ !cancelled() && inputs.macos && needs.windows.result == 'success' && needs.macos.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env: { GH_TOKEN: "${{ github.token }}", GH_REPO: "${{ github.repository }}" }
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: "${{ env.SOURCE_REPO }}", ref: "${{ env.TAG }}", token: "${{ secrets.SOURCE_TOKEN }}", persist-credentials: false, path: source }
+      - uses: actions/download-artifact@v4
+        with: { pattern: release-*, path: source/dist, merge-multiple: true }
+      - name: 发布
+        run: |
+          VER=$(tr -d '[:space:]' < VERSION); EXE=$(python3 scripts/brand/brand.py get identity.exe_name)
+          python3 scripts/release/notes.py "$TAG" > "$RUNNER_TEMP/notes.md"
+          (cd dist && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          PRE=""; case "$VER" in 0.*) PRE="--prerelease" ;; esac
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release edit "$TAG" --draft=false --title "$EXE $TAG" --notes-file "$RUNNER_TEMP/notes.md" $PRE
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --target main --title "$EXE $TAG" --notes-file "$RUNNER_TEMP/notes.md" $PRE
+          fi
+          gh api --paginate "repos/$GH_REPO/actions/artifacts?per_page=100" --jq '.artifacts[] | select(.name | test("^release-")) | .id' |
+            while read -r id; do gh api -X DELETE "repos/$GH_REPO/actions/artifacts/$id"; done
