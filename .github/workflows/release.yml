@@ -8,6 +8,7 @@ on:
     inputs:
       tag: { description: "源码仓库里已推送的标签，例如 v0.0.0.11", required: true }
       macos: { description: "同时编译 macOS 版", type: boolean, default: false }
+      stable: { description: "发布为正式版（不勾时 0.x 版本标为预发布）", type: boolean, default: false }
 permissions:
   contents: write
   actions: write # 汇总发布后删除构建构件
@@ -21,6 +22,7 @@ env:
   TAG: ${{ inputs.tag }}
   SOURCE_REPO: Enasdt/Veils-Browser
   UPDATE_REPO: ${{ github.repository }}
+  STABLE: ${{ inputs.stable }}
 
 jobs:
   windows:
@@ -66,7 +68,7 @@ jobs:
           python3 scripts/release/notes.py "$TAG" > "$RUNNER_TEMP/notes.md"
           EXE=$(python3 scripts/brand/brand.py get identity.exe_name)
           (cd dist && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
-          PRE=""; case "$VER" in 0.*) PRE="--prerelease" ;; esac
+          if [ "$STABLE" = true ]; then PRE="--prerelease=false --latest"; else PRE=""; case "$VER" in 0.*) PRE="--prerelease" ;; esac; fi
           if gh release view "$TAG" > /dev/null 2>&1; then
             gh release edit "$TAG" --draft=false --title "$EXE $TAG" --notes-file "$RUNNER_TEMP/notes.md" $PRE
             gh release upload "$TAG" dist/* --clobber
@@ -137,7 +139,7 @@ jobs:
           VER=$(tr -d '[:space:]' < VERSION); EXE=$(python3 scripts/brand/brand.py get identity.exe_name)
           python3 scripts/release/notes.py "$TAG" > "$RUNNER_TEMP/notes.md"
           (cd dist && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
-          PRE=""; case "$VER" in 0.*) PRE="--prerelease" ;; esac
+          if [ "$STABLE" = true ]; then PRE="--prerelease=false --latest"; else PRE=""; case "$VER" in 0.*) PRE="--prerelease" ;; esac; fi
           if gh release view "$TAG" > /dev/null 2>&1; then
             gh release edit "$TAG" --draft=false --title "$EXE $TAG" --notes-file "$RUNNER_TEMP/notes.md" $PRE
             gh release upload "$TAG" dist/* --clobber
