@@ -80,15 +80,20 @@ jobs:
     if: inputs.macos
     runs-on: macos-latest
     timeout-minutes: 30
-    env: { MACOSX_DEPLOYMENT_TARGET: "12.0" }
+    env: { MACOSX_DEPLOYMENT_TARGET: "12.0", CGO_LDFLAGS: "-mmacosx-version-min=12.0" }
     steps:
       - uses: actions/checkout@v4
         with: { repository: "${{ env.SOURCE_REPO }}", ref: "${{ env.TAG }}", token: "${{ secrets.SOURCE_TOKEN }}", persist-credentials: false, path: source }
+      - uses: actions/setup-python@v5 # macOS 自带 Python 没有 PyYAML，brand.py 需要
+        with: { python-version: "3.12" }
+      - name: 安装 PyYAML
+        run: python3 -m pip install --quiet pyyaml
       - name: 读版本与程序名
         run: |
           echo "VER=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_ENV"
           echo "EXE=$(python3 scripts/brand/brand.py get identity.exe_name)" >> "$GITHUB_ENV"
           echo "SLUG=$(python3 scripts/brand/brand.py get identity.slug)" >> "$GITHUB_ENV"
+          test -n "$(python3 scripts/brand/brand.py get identity.exe_name)" # 取不到程序名就直接失败
       - uses: actions/setup-go@v5
         with: { go-version-file: source/go.mod }
       - uses: pnpm/action-setup@v4
